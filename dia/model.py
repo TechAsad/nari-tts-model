@@ -5,15 +5,8 @@ import dac
 import numpy as np
 import torch
 import torchaudio
-from huggingface_hub import hf_hub_download
 
-from .audio import (
-    apply_audio_delay,
-    build_delay_indices,
-    build_revert_indices,
-    decode,
-    revert_audio_delay,
-)
+from .audio import apply_audio_delay, build_delay_indices, build_revert_indices, decode, revert_audio_delay
 from .config import DiaConfig
 from .layers import DiaModel
 from .state import DecoderInferenceState, DecoderOutput, EncoderInferenceState
@@ -21,24 +14,14 @@ from .state import DecoderInferenceState, DecoderOutput, EncoderInferenceState
 
 DEFAULT_SAMPLE_RATE = 44100
 
+
 def _get_default_device():
-    """Get default device with memory management for MPS"""
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        # Set MPS memory limit to maximum
-        import os
-        os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
-        
-        try:
-            # Test MPS memory allocation
-            test_tensor = torch.zeros((1, 1000, 1000), device="mps")
-            del test_tensor
-            return torch.device("mps")
-        except:
-            print("Warning: MPS memory test failed, falling back to CPU")
-            return torch.device("cpu")
+        return torch.device("mps")
     return torch.device("cpu")
+
 
 def _sample_next_token(
     logits_BCxV: torch.Tensor,
@@ -58,21 +41,15 @@ def _sample_next_token(
 
     if top_p < 1.0:
         probs_BCxV = torch.softmax(logits_BCxV, dim=-1)
-        sorted_probs_BCxV, sorted_indices_BCxV = torch.sort(
-            probs_BCxV, dim=-1, descending=True
-        )
+        sorted_probs_BCxV, sorted_indices_BCxV = torch.sort(probs_BCxV, dim=-1, descending=True)
         cumulative_probs_BCxV = torch.cumsum(sorted_probs_BCxV, dim=-1)
 
         sorted_indices_to_remove_BCxV = cumulative_probs_BCxV > top_p
-        sorted_indices_to_remove_BCxV[..., 1:] = sorted_indices_to_remove_BCxV[
-            ..., :-1
-        ].clone()
+        sorted_indices_to_remove_BCxV[..., 1:] = sorted_indices_to_remove_BCxV[..., :-1].clone()
         sorted_indices_to_remove_BCxV[..., 0] = 0
 
         indices_to_remove_BCxV = torch.zeros_like(sorted_indices_to_remove_BCxV)
-        indices_to_remove_BCxV.scatter_(
-            dim=-1, index=sorted_indices_BCxV, src=sorted_indices_to_remove_BCxV
-        )
+        indices_to_remove_BCxV.scatter_(dim=-1, index=sorted_indices_BCxV, src=sorted_indices_to_remove_BCxV)
         logits_BCxV = logits_BCxV.masked_fill(indices_to_remove_BCxV, -torch.inf)
 
     final_probs_BCxV = torch.softmax(logits_BCxV, dim=-1)
@@ -157,9 +134,7 @@ class Dia:
         except FileNotFoundError:
             raise FileNotFoundError(f"Checkpoint file not found at {checkpoint_path}")
         except Exception as e:
-            raise RuntimeError(
-                f"Error loading checkpoint from {checkpoint_path}"
-            ) from e
+            raise RuntimeError(f"Error loading checkpoint from {checkpoint_path}") from e
 
         dia.model.to(dia.device)
         dia.model.eval()
@@ -172,18 +147,35 @@ class Dia:
         model_name: str = "nari-labs/Dia-1.6B",
         compute_dtype: str | ComputeDtype = ComputeDtype.FLOAT32,
         device: torch.device | None = None,
-        force_cpu: bool = False,
     ) -> "Dia":
-        """
+        """Loads the Dia model from a Hugging Face Hub repository.
+
+        Downloads the configuration and checkpoint files from the specified
+        repository ID and then loads the model.
+
         Args:
-            force_cpu: If True, forces model to load on CPU regardless of available hardware
+            model_name: The Hugging Face Hub repository ID (e.g., "nari-labs/Dia-1.6B").
+            compute_dtype: The computation dtype to use.
+            device: The device to load the model onto. If None, will automatically select the best available device.
+
+        Returns:
+            An instance of the Dia model loaded with weights and set to eval mode.
+
+        Raises:
+            FileNotFoundError: If config or checkpoint download/loading fails.
+            RuntimeError: If there is an error loading the checkpoint.
         """
-        if force_cpu:
-            device = torch.device("cpu")
-        
-        config_path = hf_hub_download(repo_id=model_name, filename="config.json")
-        checkpoint_path = hf_hub_download(repo_id=model_name, filename="dia-v0_1.pth")
-        return cls.from_local(config_path, checkpoint_path, compute_dtype, device)
+        if isinstance(compute_dtype, str):
+            compute_dtype = ComputeDtype(compute_dtype)
+        loaded_model = DiaModel.from_pretrained(model_name, compute_dtype=compute_dtype.to_dtype())
+        config = loaded_model.config
+        dia = cls(config, compute_dtype, device)
+
+        dia.model = loaded_model
+        dia.model.to(dia.device)
+        dia.model.eval()
+        dia._load_dac_model()
+        return dia
 
     def _load_dac_model(self):
         try:
@@ -215,14 +207,10 @@ class Dia:
                 constant_values=text_pad_value,
             ).astype(np.uint8)
 
-        src_tokens = (
-            torch.from_numpy(padded_text_np).to(torch.long).to(self.device).unsqueeze(0)
-        )  # [1, S]
+        src_tokens = torch.from_numpy(padded_text_np).to(torch.long).to(self.device).unsqueeze(0)  # [1, S]
         return src_tokens
 
-    def _prepare_audio_prompt(
-        self, audio_prompt: torch.Tensor | None
-    ) -> tuple[torch.Tensor, int]:
+    def _prepare_audio_prompt(self, audio_prompt: torch.Tensor | None) -> tuple[torch.Tensor, int]:
         num_channels = self.config.data.channels
         audio_bos_value = self.config.data.audio_bos_value
         audio_pad_value = self.config.data.audio_pad_value
@@ -243,10 +231,7 @@ class Dia:
             prefill = torch.cat([prefill, audio_prompt], dim=0)
 
         delay_pad_tensor = torch.full(
-            (max_delay_pattern, num_channels),
-            fill_value=-1,
-            dtype=torch.int,
-            device=self.device,
+            (max_delay_pattern, num_channels), fill_value=-1, dtype=torch.int, device=self.device
         )
         prefill = torch.cat([prefill, delay_pad_tensor], dim=0)
 
@@ -266,9 +251,7 @@ class Dia:
 
         return prefill, prefill_step
 
-    def _prepare_generation(
-        self, text: str, audio_prompt: str | torch.Tensor | None, verbose: bool
-    ):
+    def _prepare_generation(self, text: str, audio_prompt: str | torch.Tensor | None, verbose: bool):
         enc_input_cond = self._prepare_text_input(text)
         enc_input_uncond = torch.zeros_like(enc_input_cond)
         enc_input = torch.cat([enc_input_uncond, enc_input_cond], dim=0)
@@ -283,15 +266,9 @@ class Dia:
         enc_state = EncoderInferenceState.new(self.config, enc_input_cond)
         encoder_out = self.model.encoder(enc_input, enc_state)
 
-        dec_cross_attn_cache = self.model.decoder.precompute_cross_attn_cache(
-            encoder_out, enc_state.positions
-        )
+        dec_cross_attn_cache = self.model.decoder.precompute_cross_attn_cache(encoder_out, enc_state.positions)
         dec_state = DecoderInferenceState.new(
-            self.config,
-            enc_state,
-            encoder_out,
-            dec_cross_attn_cache,
-            self.compute_dtype,
+            self.config, enc_state, encoder_out, dec_cross_attn_cache, self.compute_dtype
         )
         dec_output = DecoderOutput.new(self.config, self.device)
         dec_output.prefill(prefill, prefill_step)
@@ -299,9 +276,7 @@ class Dia:
         dec_step = prefill_step - 1
         if dec_step > 0:
             dec_state.prepare_step(0, dec_step)
-            tokens_BxTxC = (
-                dec_output.get_tokens_at(0, dec_step).unsqueeze(0).expand(2, -1, -1)
-            )
+            tokens_BxTxC = dec_output.get_tokens_at(0, dec_step).unsqueeze(0).expand(2, -1, -1)
             self.model.decoder.forward(tokens_BxTxC, dec_state)
 
         return dec_state, dec_output
@@ -424,16 +399,12 @@ class Dia:
         if verbose:
             print("generate: starting generation loop")
             if use_torch_compile:
-                print(
-                    "generate: by using use_torch_compile=True, the first step would take long"
-                )
+                print("generate: by using use_torch_compile=True, the first step would take long")
             start_time = time.time()
 
         while dec_step < max_tokens:
             dec_state.prepare_step(dec_step)
-            tokens_Bx1xC = (
-                dec_output.get_tokens_at(dec_step).unsqueeze(0).expand(2, -1, -1)
-            )
+            tokens_Bx1xC = dec_output.get_tokens_at(dec_step).unsqueeze(0).expand(2, -1, -1)
             pred_C = step_fn(
                 tokens_Bx1xC,
                 dec_state,
@@ -443,9 +414,7 @@ class Dia:
                 cfg_filter_top_k,
             )
 
-            if (
-                not eos_detected and pred_C[0] == audio_eos_value
-            ) or dec_step == max_tokens - max_delay_pattern - 1:
+            if (not eos_detected and pred_C[0] == audio_eos_value) or dec_step == max_tokens - max_delay_pattern - 1:
                 eos_detected = True
                 eos_countdown = max_delay_pattern
 
@@ -476,15 +445,11 @@ class Dia:
             print("Warning: Nothing generated")
             return None
 
-        generated_codes = dec_output.generated_tokens[
-            dec_output.prefill_step : dec_step + 1, :
-        ]
+        generated_codes = dec_output.generated_tokens[dec_output.prefill_step : dec_step + 1, :]
 
         if verbose:
             total_step = dec_step + 1 - dec_output.prefill_step
             total_duration = time.time() - total_start_time
-            print(
-                f"generate: total step={total_step}, total duration={total_duration:.3f}s"
-            )
+            print(f"generate: total step={total_step}, total duration={total_duration:.3f}s")
 
         return self._generate_output(generated_codes)

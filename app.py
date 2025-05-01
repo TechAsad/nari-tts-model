@@ -1,8 +1,8 @@
+import argparse
 import tempfile
 import time
 from pathlib import Path
 from typing import Optional, Tuple
-import spaces
 
 import gradio as gr
 import numpy as np
@@ -12,21 +12,38 @@ import torch
 from dia.model import Dia
 
 
+# --- Global Setup ---
+parser = argparse.ArgumentParser(description="Gradio interface for Nari TTS")
+parser.add_argument("--device", type=str, default=None, help="Force device (e.g., 'cuda', 'mps', 'cpu')")
+parser.add_argument("--share", action="store_true", help="Enable Gradio sharing")
+
+args = parser.parse_args()
+
+
+# Determine device
+if args.device:
+    device = torch.device(args.device)
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+# Simplified MPS check for broader compatibility
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    # Basic check is usually sufficient, detailed check can be problematic
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+print(f"Using device: {device}")
+
 # Load Nari model and config
 print("Loading Nari model...")
 try:
-    # First try with default device
-    model = Dia.from_pretrained("nari-labs/Dia-1.6B", compute_dtype="float32")
-except RuntimeError as e:
-    if "MPS backend out of memory" in str(e):
-        print("MPS memory error encountered, falling back to CPU...")
-        model = Dia.from_pretrained("nari-labs/Dia-1.6B", compute_dtype="float32", force_cpu=True)
-    else:
-        print(f"Error loading Nari model: {e}")
-        raise
+    # Use the function from inference.py
+    model = Dia.from_pretrained("nari-labs/Dia-1.6B", compute_dtype="float16", device=device)
+except Exception as e:
+    print(f"Error loading Nari model: {e}")
+    raise
 
 
-@spaces.GPU
 def run_inference(
     text_input: str,
     audio_prompt_input: Optional[Tuple[int, np.ndarray]],
@@ -41,7 +58,7 @@ def run_inference(
     Runs Nari inference using the globally loaded model and provided inputs.
     Uses temporary files for text and audio prompt compatibility with inference.generate.
     """
-    # global model, device  # Access global model, config, device
+    global model, device  # Access global model, config, device
 
     if not text_input or text_input.isspace():
         raise gr.Error("Text input cannot be empty.")
@@ -55,15 +72,11 @@ def run_inference(
         if audio_prompt_input is not None:
             sr, audio_data = audio_prompt_input
             # Check if audio_data is valid
-            if (
-                audio_data is None or audio_data.size == 0 or audio_data.max() == 0
-            ):  # Check for silence/empty
+            if audio_data is None or audio_data.size == 0 or audio_data.max() == 0:  # Check for silence/empty
                 gr.Warning("Audio prompt seems empty or silent, ignoring prompt.")
             else:
                 # Save prompt audio to a temporary WAV file
-                with tempfile.NamedTemporaryFile(
-                    mode="wb", suffix=".wav", delete=False
-                ) as f_audio:
+                with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as f_audio:
                     temp_audio_prompt_path = f_audio.name  # Store path for cleanup
 
                     # Basic audio preprocessing for consistency
@@ -72,16 +85,12 @@ def run_inference(
                         max_val = np.iinfo(audio_data.dtype).max
                         audio_data = audio_data.astype(np.float32) / max_val
                     elif not np.issubdtype(audio_data.dtype, np.floating):
-                        gr.Warning(
-                            f"Unsupported audio prompt dtype {audio_data.dtype}, attempting conversion."
-                        )
+                        gr.Warning(f"Unsupported audio prompt dtype {audio_data.dtype}, attempting conversion.")
                         # Attempt conversion, might fail for complex types
                         try:
                             audio_data = audio_data.astype(np.float32)
                         except Exception as conv_e:
-                            raise gr.Error(
-                                f"Failed to convert audio prompt to float32: {conv_e}"
-                            )
+                            raise gr.Error(f"Failed to convert audio prompt to float32: {conv_e}")
 
                     # Ensure mono (average channels if stereo)
                     if audio_data.ndim > 1:
@@ -94,13 +103,9 @@ def run_inference(
                                 f"Audio prompt has unexpected shape {audio_data.shape}, taking first channel/axis."
                             )
                             audio_data = (
-                                audio_data[0]
-                                if audio_data.shape[0] < audio_data.shape[1]
-                                else audio_data[:, 0]
+                                audio_data[0] if audio_data.shape[0] < audio_data.shape[1] else audio_data[:, 0]
                             )
-                        audio_data = np.ascontiguousarray(
-                            audio_data
-                        )  # Ensure contiguous after slicing/mean
+                        audio_data = np.ascontiguousarray(audio_data)  # Ensure contiguous after slicing/mean
 
                     # Write using soundfile
                     try:
@@ -108,9 +113,7 @@ def run_inference(
                             temp_audio_prompt_path, audio_data, sr, subtype="FLOAT"
                         )  # Explicitly use FLOAT subtype
                         prompt_path_for_generate = temp_audio_prompt_path
-                        print(
-                            f"Created temporary audio prompt file: {temp_audio_prompt_path} (orig sr: {sr})"
-                        )
+                        print(f"Created temporary audio prompt file: {temp_audio_prompt_path} (orig sr: {sr})")
                     except Exception as write_e:
                         print(f"Error writing temporary audio file: {write_e}")
                         raise gr.Error(f"Failed to save audio prompt: {write_e}")
@@ -144,12 +147,8 @@ def run_inference(
             original_len = len(output_audio_np)
             # Ensure speed_factor is positive and not excessively small/large to avoid issues
             speed_factor = max(0.1, min(speed_factor, 5.0))
-            target_len = int(
-                original_len / speed_factor
-            )  # Target length based on speed_factor
-            if (
-                target_len != original_len and target_len > 0
-            ):  # Only interpolate if length changes and is valid
+            target_len = int(original_len / speed_factor)  # Target length based on speed_factor
+            if target_len != original_len and target_len > 0:  # Only interpolate if length changes and is valid
                 x_original = np.arange(original_len)
                 x_resampled = np.linspace(0, original_len - 1, target_len)
                 resampled_audio_np = np.interp(x_resampled, x_original, output_audio_np)
@@ -157,9 +156,7 @@ def run_inference(
                     output_sr,
                     resampled_audio_np.astype(np.float32),
                 )  # Use resampled audio
-                print(
-                    f"Resampled audio from {original_len} to {target_len} samples for {speed_factor:.2f}x speed."
-                )
+                print(f"Resampled audio from {original_len} to {target_len} samples for {speed_factor:.2f}x speed.")
             else:
                 output_audio = (
                     output_sr,
@@ -168,15 +165,10 @@ def run_inference(
                 print(f"Skipping audio speed adjustment (factor: {speed_factor:.2f}).")
             # --- End slowdown ---
 
-            print(
-                f"Audio conversion successful. Final shape: {output_audio[1].shape}, Sample Rate: {output_sr}"
-            )
+            print(f"Audio conversion successful. Final shape: {output_audio[1].shape}, Sample Rate: {output_sr}")
 
             # Explicitly convert to int16 to prevent Gradio warning
-            if (
-                output_audio[1].dtype == np.float32
-                or output_audio[1].dtype == np.float64
-            ):
+            if output_audio[1].dtype == np.float32 or output_audio[1].dtype == np.float64:
                 audio_for_gradio = np.clip(output_audio[1], -1.0, 1.0)
                 audio_for_gradio = (audio_for_gradio * 32767).astype(np.int16)
                 output_audio = (output_sr, audio_for_gradio)
@@ -202,17 +194,13 @@ def run_inference(
                 Path(temp_txt_file_path).unlink()
                 print(f"Deleted temporary text file: {temp_txt_file_path}")
             except OSError as e:
-                print(
-                    f"Warning: Error deleting temporary text file {temp_txt_file_path}: {e}"
-                )
+                print(f"Warning: Error deleting temporary text file {temp_txt_file_path}: {e}")
         if temp_audio_prompt_path and Path(temp_audio_prompt_path).exists():
             try:
                 Path(temp_audio_prompt_path).unlink()
                 print(f"Deleted temporary audio prompt file: {temp_audio_prompt_path}")
             except OSError as e:
-                print(
-                    f"Warning: Error deleting temporary audio prompt file {temp_audio_prompt_path}: {e}"
-                )
+                print(f"Warning: Error deleting temporary audio prompt file {temp_audio_prompt_path}: {e}")
 
     return output_audio
 
@@ -379,4 +367,4 @@ if __name__ == "__main__":
 
     # set `GRADIO_SERVER_NAME`, `GRADIO_SERVER_PORT` env vars to override default values
     # use `GRADIO_SERVER_NAME=0.0.0.0` for Docker
-    demo.launch()
+    demo.launch(share=args.share)
